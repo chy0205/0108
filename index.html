@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>收視率報表自動彙整工具</title>
+    <title>收視率報表自動彙整工具 (支援1/2分鐘辨識)</title>
     <!-- 引入外部 SheetJS 處理 Excel -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <style>
@@ -115,8 +115,8 @@
             white-space: nowrap;
         }
         tr:nth-child(even) { background-color: #f8fafc; }
-        /* 標記表頭區域背景顏色 */
         .header-row { background-color: #fff7ed !important; }
+        .date-col { color: var(--primary-color); font-weight: bold; background-color: #f0f7ff; }
 
         #status { margin-top: 1rem; font-weight: bold; }
         .success { color: var(--success-color); }
@@ -128,7 +128,7 @@
 <div class="card">
     <h1>📈 收視率報表彙整</h1>
     <p class="desc">
-        保留首檔前 22 列設定資訊，數據將依時間自動去重並分類下載
+        支援<strong>1分鐘與2分鐘</strong>報表自動辨識。不同日期將拆分為分頁，檔案名稱不含年份。
     </p>
     
     <div class="drop-zone" onclick="document.getElementById('fileInput').click()">
@@ -138,15 +138,15 @@
     </div>
 
     <div class="button-group">
-        <button id="processBtn" disabled>1. 彙整、去重並預覽</button>
-        <button id="downloadBtn">2. 下載分時段報表</button>
+        <button id="processBtn" disabled>1. 彙整資料並預覽</button>
+        <button id="downloadBtn">2. 下載分時段報表 (自動區分1/2分鐘)</button>
     </div>
     <div id="status"></div>
 </div>
 
 <div class="preview-container" id="previewContainer">
     <div class="preview-header">
-        <span>彙整預覽 (已過濾重複時間，顯示前 1000 筆)</span>
+        <span>彙整預覽 (日期與間隔標註於首欄)</span>
     </div>
     <div class="table-wrapper">
         <table id="previewTable"></table>
@@ -162,7 +162,6 @@
     const previewContainer = document.getElementById('previewContainer');
     const previewTable = document.getElementById('previewTable');
 
-    // 定義時段及其對應名稱
     const timeSlots = [
         { label: "晨間", start: "07:00:00", end: "08:59:59" },
         { label: "9點", start: "09:00:00", end: "09:59:59" },
@@ -178,7 +177,7 @@
     ];
 
     let globalHeader = [];
-    let globalBody = [];
+    let globalBodyWithDate = [];
 
     fileInput.addEventListener('change', () => {
         fileListDiv.innerHTML = '';
@@ -197,103 +196,167 @@
         }
     });
 
+    // 辨識資料間隔 (1分鐘或2分鐘)
+    function detectInterval(rows) {
+        if (rows.length < 2) return 1;
+        const t1 = rows[0][0];
+        const t2 = rows[1][0];
+        if (!t1 || !t2) return 1;
+        
+        const parseToSec = (str) => {
+            const p = String(str).split(':');
+            return p.length >= 2 ? parseInt(p[0]) * 3600 + parseInt(p[1]) * 60 + (parseInt(p[2]) || 0) : 0;
+        };
+        
+        const diff = Math.abs(parseToSec(t2) - parseToSec(t1));
+        return (diff >= 110 && diff <= 130) ? 2 : 1; // 120秒左右判斷為2分鐘
+    }
+
     processBtn.addEventListener('click', async () => {
         const files = fileInput.files;
-        statusDiv.innerHTML = '⏳ 處理中...';
+        statusDiv.innerHTML = '⏳ 正在分析數據結構與日期...';
         processBtn.disabled = true;
 
         try {
             globalHeader = [];
-            let rawBody = []; // 存放所有檔案的原始數據內容
+            let combinedData = [];
 
             for (let i = 0; i < files.length; i++) {
-                const data = await readExcelData(files[i]);
-                if (i === 0) {
-                    // 保留第一個檔案的前 22 列作為報表設定頭部
-                    globalHeader = data.slice(0, 22);
-                    if (data.length > 22) rawBody = rawBody.concat(data.slice(22));
-                } else {
-                    // 其他檔案只合併數據部分 (22列以後)
-                    if (data.length > 22) rawBody = rawBody.concat(data.slice(22));
-                }
+                const sheets = await readAllSheetsData(files[i]);
+                
+                sheets.forEach((sheetData, sIdx) => {
+                    let sheetDate = "Unknown";
+                    if (sheetData[19] && sheetData[19][1]) {
+                        const rawDate = String(sheetData[19][1]);
+                        const dateMatch = rawDate.match(/\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2}/);
+                        sheetDate = dateMatch ? dateMatch[0].replace(/\//g, "-") : rawDate.trim();
+                    }
+
+                    if (i === 0 && sIdx === 0) {
+                        globalHeader = sheetData.slice(0, 22);
+                    }
+
+                    if (sheetData.length > 22) {
+                        const body = sheetData.slice(22);
+                        const interval = detectInterval(body);
+                        
+                        body.forEach(row => {
+                            if (row[0]) {
+                                combinedData.push({
+                                    date: sheetDate,
+                                    time: String(row[0]).trim(),
+                                    interval: interval, // 儲存辨識出的間隔
+                                    rawRow: row
+                                });
+                            }
+                        });
+                    }
+                });
             }
 
-            // --- 關鍵修改：去重邏輯 (Unique By Time) ---
-            // 使用 Map 物件，Key 為時間字串，確保唯一性
             const uniqueMap = new Map();
-            rawBody.forEach(row => {
-                // 假設時間在第一欄 (Column A)，進行去空格處理
-                const timeKey = row[0] ? String(row[0]).trim() : "";
-                // 如果該時間點尚未存在，則存入 Map；若已存在則跳過 (保留第一筆看到的)
-                if (timeKey !== "" && !uniqueMap.has(timeKey)) {
-                    uniqueMap.set(timeKey, row);
+            combinedData.forEach(item => {
+                // key 加入 interval 確保 1分鐘與 2分鐘資料不會互相覆蓋
+                const compositeKey = `${item.date}_${item.interval}_${item.time}`;
+                if (!uniqueMap.has(compositeKey)) {
+                    uniqueMap.set(compositeKey, item);
                 }
             });
 
-            // 將去重後的數據轉回陣列
-            globalBody = Array.from(uniqueMap.values());
-
-            // --- 依時間排序 ---
-            globalBody.sort((a, b) => {
-                const valA = a[0] ? String(a[0]) : "";
-                const valB = b[0] ? String(b[0]) : "";
-                return valA.localeCompare(valB, undefined, {numeric: true});
+            const sortedList = Array.from(uniqueMap.values()).sort((a, b) => {
+                if (a.date !== b.date) return a.date.localeCompare(b.date);
+                if (a.interval !== b.interval) return a.interval - b.interval;
+                return a.time.localeCompare(b.time, undefined, {numeric: true});
             });
 
-            // 預覽前 1000 筆 (包含 Header)
-            renderPreview(globalHeader.concat(globalBody.slice(0, 1000)));
+            globalBodyWithDate = sortedList;
+            renderEnhancedPreview(sortedList.slice(0, 2000));
             
             statusDiv.className = 'success';
-            statusDiv.innerHTML = `✅ 彙整完成！合併 ${files.length} 檔，去重前 ${rawBody.length} 筆，去重後 ${globalBody.length} 筆。`;
+            const dateList = [...new Set(sortedList.map(i => i.date))];
+            const intervalList = [...new Set(sortedList.map(i => i.interval + "分鐘"))];
+            statusDiv.innerHTML = `✅ 彙整成功！日期：${dateList.join(", ")}，包含間隔：${intervalList.join("、")}。`;
             downloadBtn.style.display = 'block';
             previewContainer.style.display = 'block';
         } catch (error) {
             console.error(error);
             statusDiv.className = 'error';
-            statusDiv.innerHTML = '❌ 發生錯誤，請確認檔案內容是否正確。';
+            statusDiv.innerHTML = '❌ 處理失敗，請檢查檔案內容。';
         } finally {
             processBtn.disabled = false;
         }
     });
 
     downloadBtn.addEventListener('click', async () => {
-        const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+        const sortedData = globalBodyWithDate;
+        const allDates = [...new Set(sortedData.map(i => i.date))].sort();
+        
+        const formatFileNameDate = (dateStr) => {
+            const clean = dateStr.replace(/[^0-9]/g, "");
+            return clean.length >= 8 ? clean.substring(4) : clean;
+        };
+
+        const dateRangeStr = allDates.length > 1 
+            ? `${formatFileNameDate(allDates[0])}-${formatFileNameDate(allDates[allDates.length-1])}`
+            : (allDates[0] ? formatFileNameDate(allDates[0]) : "Report");
+
         let downloadCount = 0;
 
+        // 時段迴圈
         for (const slot of timeSlots) {
-            // 篩選出符合該時段區間的數據
-            const filteredBody = globalBody.filter(row => {
-                const time = String(row[0]); 
-                return time >= slot.start && time <= slot.end;
-            });
+            // 時段內資料
+            const slotData = sortedData.filter(item => item.time >= slot.start && item.time <= slot.end);
+            if (slotData.length === 0) continue;
 
-            // 若該時段無數據則不產檔
-            if (filteredBody.length === 0) continue;
-
-            const finalOutput = globalHeader.concat(filteredBody);
-            const ws = XLSX.utils.aoa_to_sheet(finalOutput);
-            const wb = XLSX.utils.book_new();
-            XLSX.utils.book_append_sheet(wb, ws, slot.label);
-
-            const fileName = `${dateStr} ${slot.label}1分鐘.xlsx`;
+            // 分開處理 1 分鐘與 2 分鐘
+            const availableIntervals = [...new Set(slotData.map(item => item.interval))];
             
-            XLSX.writeFile(wb, fileName);
-            downloadCount++;
-            
-            // 稍作延遲，防止瀏覽器阻擋多個下載視窗
-            await new Promise(r => setTimeout(r, 400));
+            for (const inv of availableIntervals) {
+                const invData = slotData.filter(item => item.interval === inv);
+                const wb = XLSX.utils.book_new();
+                const datesInSlot = [...new Set(invData.map(item => item.date))].sort();
+                
+                datesInSlot.forEach(targetDate => {
+                    const dayRows = invData
+                        .filter(item => item.date === targetDate)
+                        .map(item => item.rawRow);
+                    
+                    const sheetContent = globalHeader.concat(dayRows);
+                    const ws = XLSX.utils.aoa_to_sheet(sheetContent);
+                    XLSX.utils.book_append_sheet(wb, ws, targetDate.slice(-10));
+                });
+
+                XLSX.writeFile(wb, `${dateRangeStr} ${slot.label}${inv}分鐘.xlsx`);
+                downloadCount++;
+                await new Promise(r => setTimeout(r, 450));
+            }
         }
-        statusDiv.innerHTML = `✅ 已下載 ${downloadCount} 個檔案。`;
+        statusDiv.innerHTML = `✅ 下載完成！共產生 ${downloadCount} 個報表。`;
     });
 
-    function renderPreview(data) {
+    function renderEnhancedPreview(sortedDataItems) {
         previewTable.innerHTML = '';
-        data.forEach((row, rowIndex) => {
+        globalHeader.forEach((row, idx) => {
             const tr = document.createElement('tr');
-            if (rowIndex < 22) tr.className = 'header-row'; // 高亮表頭
-
-            // 僅預覽前 10 欄
+            tr.className = 'header-row';
+            const dateTd = document.createElement('td');
+            dateTd.textContent = "-";
+            tr.appendChild(dateTd);
             row.slice(0, 10).forEach(cell => {
+                const td = document.createElement('td');
+                td.textContent = cell !== undefined ? cell : "";
+                tr.appendChild(td);
+            });
+            previewTable.appendChild(tr);
+        });
+
+        sortedDataItems.forEach(item => {
+            const tr = document.createElement('tr');
+            const infoTd = document.createElement('td');
+            infoTd.className = 'date-col';
+            infoTd.innerHTML = `${item.date}<br><small>(${item.interval}min)</small>`;
+            tr.appendChild(infoTd);
+            item.rawRow.slice(0, 10).forEach(cell => {
                 const td = document.createElement('td');
                 td.textContent = cell !== undefined ? cell : "";
                 tr.appendChild(td);
@@ -302,17 +365,19 @@
         });
     }
 
-    function readExcelData(file) {
+    function readAllSheetsData(file) {
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.onload = (e) => {
                 try {
                     const workbook = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
-                    // 讀取第一個分頁
-                    const sheetName = workbook.SheetNames[0];
-                    const sheet = workbook.Sheets[sheetName];
-                    // 轉換為二維陣列
-                    resolve(XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }));
+                    const result = [];
+                    workbook.SheetNames.forEach(name => {
+                        const sheet = workbook.Sheets[name];
+                        const data = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+                        if (data.length > 0) result.push(data);
+                    });
+                    resolve(result);
                 } catch (err) {
                     reject(err);
                 }
